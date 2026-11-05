@@ -1,6 +1,8 @@
 # 🤖 ULTRON AI
 ### Autonomous Desktop Intelligence, Neural Knowledge Graph & Workstation Orchestrator
 
+Desktop release branch: `ui-polish`. Based on [AbuZar-Ansarii/Ultron](https://github.com/AbuZar-Ansarii/Ultron), with the upstream history preserved.
+
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)](#)
 [![LLM](https://img.shields.io/badge/Engine-Gemini%20Live%20%7C%20Ollama%20%7C%20OpenAI-purple.svg)](#)
@@ -49,8 +51,8 @@ the automated tests use local servers or mocks and do not verify real-world work
 
 ### 1. Clone & Install
 ```bash
-git clone https://github.com/AbuZar-Ansarii/Ultron.git
-cd "Ultron"
+git clone --branch ui-polish https://github.com/RGowthamRaj/ultron-desktop-final.git
+cd "ultron-desktop-final"
 pip install -r requirements.txt
 ```
 
