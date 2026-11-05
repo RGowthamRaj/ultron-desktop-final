@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 def get_base_dir() -> Path:
@@ -13,6 +15,23 @@ CONFIG_FILE = CONFIG_DIR / "api_keys.json"
 
 def ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_config(data: dict) -> None:
+    """Replace preferences atomically; never leave a truncated credentials file."""
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=CONFIG_FILE.parent,
+                                         prefix='.ultron-', suffix='.tmp', delete=False) as handle:
+            temporary = handle.name
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, CONFIG_FILE)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 def config_exists() -> bool:
     return CONFIG_FILE.exists()
@@ -38,9 +57,10 @@ def load_api_keys() -> dict:
     if not CONFIG_FILE.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
+        print('Could not load saved preferences. Reconfigure the provider in the setup screen.')
         return {}
 
 def get_gemini_key() -> str | None:
@@ -74,10 +94,12 @@ def get_provider_key(provider: str = "") -> str:
     """Retrieve the API key for the specified provider (or the active provider if empty)."""
     cfg = load_api_keys()
     p = (provider or get_ai_provider() or "gemini").lower()
+    from core.provider_settings import KEY_FIELDS
     return (
+        cfg.get(KEY_FIELDS.get(p, f"{p}_api_key")) or
         cfg.get(f"{p}_api_key") or
         cfg.get(f"{p}_key") or
-        cfg.get("api_key") or
+        (cfg.get("api_key") if cfg.get("ai_provider") == p else "") or
         (cfg.get("gemini_api_key") if p == "gemini" else "") or
         (cfg.get("openai_api_key") if p == "gpt" else "") or
         ""
@@ -102,32 +124,11 @@ def get_provider_url(provider: str = "") -> str:
     return cfg.get(f"{p}_base_url") or ""
 
 def save_ai_provider(provider: str, model: str, api_key: str = "", base_url: str = "") -> None:
-    """Save chosen AI provider, model, API key, and base URL to config."""
-    ensure_config_dir()
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data["ai_provider"] = provider.strip().lower()
-    data["ai_model"] = model.strip()
-    p = data["ai_provider"]
-    if api_key:
-        data["api_key"] = api_key.strip()
-        data[f"{p}_api_key"] = api_key.strip()
-        if p == "gemini":
-            data["gemini_api_key"] = api_key.strip()
-        elif p == "gpt":
-            data["openai_api_key"] = api_key.strip()
-        elif p == "claude":
-            data["anthropic_api_key"] = api_key.strip()
-    if base_url:
-        data[f"{p}_base_url"] = base_url.strip()
-        if p == "ollama":
-            data["llm_url"] = base_url.strip()
-            data["llm_model"] = model.strip()
-    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+    """Validate and atomically persist a provider without cross-provider key reuse."""
+    from core.provider_settings import Connection, updated_config
+    data = updated_config(load_api_keys(), Connection(provider.strip().lower(), model, api_key, base_url))
+    save_config(data)
+
 
 def is_configured() -> bool:
     cfg = load_api_keys()

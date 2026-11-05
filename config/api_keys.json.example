@@ -1,13 +1,11 @@
 {
-    "assistant_name": "Ultron",
-    "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
-    "os_system": "windows",
-    "provider": "gemini",
-    "model": "models/gemini-2.0-flash-exp",
-    "voice_name": "Ultron",
-    "voice_rate": "+15%",
-    "user_name": "Boss",
-    "ui_color": "#ff0008",
-    "ultron_voice_warp": true,
-    "camera_index": 0
+  "ai_provider": "gpt",
+  "ai_model": "gpt-4.1-mini",
+  "openai_api_key": "",
+  "openai_base_url": "https://api.openai.com/v1",
+  "os_system": "windows",
+  "assistant_name": "Ultron",
+  "tools_enabled": false,
+  "speak_replies": false,
+  "listen_on_launch": false
 }

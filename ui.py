@@ -50,7 +50,7 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
@@ -85,7 +85,8 @@ API_FILE   = CONFIG_DIR / "api_keys.json"
 def _read_full_config() -> dict:
     """Read api_keys.json config dict. Returns {} on any error."""
     try:
-        return json.loads(API_FILE.read_text(encoding="utf-8"))
+        data = json.loads(API_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -95,8 +96,8 @@ def _read_full_config() -> dict:
 APP_VERSION  = "ULTRON"
 APP_PROTOCOL = APP_VERSION.split()[-1]
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
-_MIN_W,     _MIN_H     = 820, 580
+_DEFAULT_W, _DEFAULT_H = 1280, 820
+_MIN_W,     _MIN_H     = 1100, 720
 _LEFT_W  = 148
 _RIGHT_W = 340
 
@@ -1522,12 +1523,13 @@ PROVIDER_INFO = {
         "models": [
             "gpt-4o",
             "gpt-4o-mini",
-            "gpt-4.5-preview",
+            "gpt-4.1-mini",
+            "gpt-4.1",
             "o3-mini",
             "o1",
             "gpt-4-turbo",
         ],
-        "default_model": "gpt-4o",
+        "default_model": "gpt-4.1-mini",
         "key_label": "OPENAI API KEY",
         "key_placeholder": "sk-proj-...",
         "has_url": False,
@@ -1626,257 +1628,204 @@ PROVIDER_INFO = {
 
 class SetupOverlay(QWidget):
     done = pyqtSignal(dict)
+    dismissed = pyqtSignal()
+    _test_result = pyqtSignal(int, object, bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"""
-            SetupOverlay {{
-                background: rgba(0, 6, 10, 250);
-                border: 1px solid {C.BORDER_B};
-                border-radius: 6px;
-            }}
-        """)
-
-        cfg = _read_full_config()
-
-        detected = {"darwin": "mac", "windows": "windows"}.get(
-            _OS.lower(), "linux"
-        )
-        self._sel_os = cfg.get("os_system") or detected
-
+        self.setStyleSheet(f"SetupOverlay {{ background: {C.PANEL}; border: 1px solid {C.BORDER_B}; border-radius: 16px; }}")
+        self._generation = 0
+        self._checking = False
+        self._cfg = _read_full_config()
+        self._sel_os = self._cfg.get('os_system') or {'Windows': 'windows', 'Darwin': 'mac'}.get(_OS, 'linux')
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 18, 24, 18)
-        layout.setSpacing(6)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(12)
 
-        def _lbl(txt, font_size=9, bold=False, color=C.PRI,
-                 align=Qt.AlignmentFlag.AlignCenter):
-            w = QLabel(txt)
-            w.setAlignment(align)
-            w.setFont(QFont("Courier New", font_size,
-                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
-            w.setStyleSheet(f"color: {color}; background: transparent;")
-            return w
+        def label(text, size=10, color=None, bold=False):
+            widget = QLabel(text)
+            widget.setFont(QFont('Segoe UI', size, QFont.Weight.Bold if bold else QFont.Weight.Normal))
+            widget.setStyleSheet(f'color: {color or C.TEXT}; background: transparent; border: none;')
+            widget.setWordWrap(True)
+            return widget
 
-        layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 12, True))
-        layout.addWidget(_lbl("Configure Ultron AI before startup.", 8, color=C.PRI_DIM))
-        layout.addSpacing(3)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
-        layout.addSpacing(2)
-
-        _combo_style = f"""
-            QComboBox {{
-                background: #000d12; color: {C.PRI};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
-                font-family: 'Courier New'; font-size: 9pt;
-            }}
-            QComboBox:focus {{ border: 1px solid {C.PRI}; }}
-            QComboBox::drop-down {{ border: none; }}
-            QComboBox QAbstractItemView {{
-                background: #000d12; color: {C.TEXT};
-                selection-background-color: #002b36; selection-color: {C.PRI};
-                border: 1px solid {C.BORDER_B};
-            }}
-        """
-        _input_style = f"""
-            QLineEdit {{
-                background: #000d12; color: {C.TEXT};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
-                font-family: 'Courier New'; font-size: 9pt;
-            }}
-            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
-        """
-
-        # ── 1. AI Provider ───────────────────────────
-        layout.addWidget(_lbl("1. SELECT AI PROVIDER", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        layout.addWidget(label('ULTRON / CONNECTION', 9, C.PRI, True))
+        layout.addWidget(label('Make room for your next idea.', 22, bold=True))
+        layout.addWidget(label('Connect an AI provider or a local model. Your preferences stay on this computer.', 10, C.TEXT_MED))
+        form = QGridLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(8)
+        form.setColumnStretch(0, 1)
+        form.setColumnStretch(1, 1)
+        field_style = f'''QLineEdit, QComboBox {{ background: {C.PANEL2}; color: {C.TEXT};
+            border: 1px solid {C.BORDER_B}; border-radius: 7px; padding: 8px; font: 10pt 'Segoe UI'; }}
+            QLineEdit:focus, QComboBox:focus {{ border-color: {C.PRI}; }}
+            QComboBox QAbstractItemView {{ background: {C.PANEL2}; color: {C.TEXT}; selection-background-color: {C.PRI_DIM}; }}'''
         self._provider_combo = QComboBox()
-        self._provider_combo.setStyleSheet(_combo_style)
-        self._provider_combo.setFixedHeight(30)
-
-        for p_key, p_info in PROVIDER_INFO.items():
-            self._provider_combo.addItem(p_info["name"], p_key)
-
-        saved_prov = cfg.get("ai_provider", "gemini").lower()
-        idx = self._provider_combo.findData(saved_prov)
-        if idx >= 0:
-            self._provider_combo.setCurrentIndex(idx)
-
-        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        layout.addWidget(self._provider_combo)
-        layout.addSpacing(4)
-
-        # ── 2. AI Model ──────────────────────────────
-        layout.addWidget(_lbl("2. SELECT AI MODEL", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        for key, info in PROVIDER_INFO.items():
+            self._provider_combo.addItem(info['name'], key)
+        index = self._provider_combo.findData(self._cfg.get('ai_provider', 'gemini'))
+        if index >= 0:
+            self._provider_combo.setCurrentIndex(index)
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
-        self._model_combo.setStyleSheet(_combo_style)
-        self._model_combo.setFixedHeight(30)
-        layout.addWidget(self._model_combo)
-        layout.addSpacing(4)
-
-        # ── 3. API Key & URL Fields ──────────────────
-        self._key_lbl = _lbl("3. API KEY", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(self._key_lbl)
-
+        for widget in (self._provider_combo, self._model_combo):
+            widget.setStyleSheet(field_style)
+            widget.setMinimumHeight(38)
+        form.addWidget(label('AI provider'), 0, 0)
+        form.addWidget(label('Model ID'), 0, 1)
+        form.addWidget(self._provider_combo, 1, 0)
+        form.addWidget(self._model_combo, 1, 1)
+        self._key_lbl = label('API key')
+        form.addWidget(self._key_lbl, 2, 0, 1, 2)
+        key_row = QHBoxLayout()
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setFont(QFont("Courier New", 9))
-        self._key_input.setFixedHeight(30)
-        self._key_input.setStyleSheet(_input_style)
-        layout.addWidget(self._key_input)
-        layout.addSpacing(4)
-
-        self._url_lbl = _lbl("SERVER / BASE URL", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(self._url_lbl)
-
+        self._key_input.setStyleSheet(field_style)
+        self._key_input.setMinimumHeight(38)
+        self._show_key = QPushButton('Show')
+        self._show_key.setCheckable(True)
+        self._show_key.setFixedWidth(65)
+        self._show_key.toggled.connect(self._toggle_key)
+        key_row.addWidget(self._key_input, 1)
+        key_row.addWidget(self._show_key)
+        form.addLayout(key_row, 3, 0, 1, 2)
+        self._url_lbl = label('Provider base URL')
         self._url_input = QLineEdit()
-        self._url_input.setFont(QFont("Courier New", 9))
-        self._url_input.setFixedHeight(30)
-        self._url_input.setStyleSheet(_input_style)
-        layout.addWidget(self._url_input)
-        layout.addSpacing(6)
-
-        # Trigger initial population of model and fields
+        self._url_input.setMinimumHeight(38)
+        self._url_input.setStyleSheet(field_style)
+        form.addWidget(self._url_lbl, 4, 0, 1, 2)
+        form.addWidget(self._url_input, 5, 0, 1, 2)
+        layout.addLayout(form)
+        self._local_hint = label('API keys are saved locally in the ignored configuration file. Do not share that file.', 9, C.TEXT_MED)
+        layout.addWidget(self._local_hint)
+        options = QGridLayout()
+        self._tools_check = QCheckBox('Enable desktop tools')
+        self._voice_check = QCheckBox('Speak replies')
+        self._listen_check = QCheckBox('Listen on launch')
+        self._tools_check.setChecked(self._cfg.get('tools_enabled', False))
+        self._voice_check.setChecked(self._cfg.get('speak_replies', _OS == 'Windows'))
+        self._listen_check.setChecked(self._cfg.get('listen_on_launch', _OS == 'Windows'))
+        for index, widget in enumerate((self._tools_check, self._voice_check, self._listen_check)):
+            widget.setStyleSheet(f'''QCheckBox {{ color: {C.TEXT_MED}; background: transparent; font: 10pt "Segoe UI"; spacing: 7px; }}
+                QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {C.TEXT_DIM}; border-radius: 3px; background: {C.PANEL2}; }}
+                QCheckBox::indicator:checked {{ background: {C.PRI}; border-color: {C.PRI}; }}''')
+            options.addWidget(widget, 0, index)
+        layout.addLayout(options)
+        self._status = label('Test your connection, or save when you are ready.', 10, C.TEXT_MED)
+        self._status.setMinimumHeight(40)
+        layout.addWidget(self._status)
+        buttons = QHBoxLayout()
+        self._test_btn = QPushButton('Test connection')
+        self._submit_btn = QPushButton('Save and start')
+        self._cancel_btn = QPushButton('Explore UI' if not self._cfg else 'Cancel')
+        for widget in (self._test_btn, self._submit_btn, self._cancel_btn, self._show_key):
+            widget.setCursor(Qt.CursorShape.PointingHandCursor)
+            widget.setMinimumHeight(36)
+            widget.setStyleSheet(f'''QPushButton {{ background: {C.PANEL2}; color: {C.TEXT}; border: 1px solid {C.BORDER_B}; border-radius: 7px; padding: 7px; font: 10pt 'Segoe UI'; }}
+                QPushButton:hover {{ border-color: {C.PRI}; }} QPushButton:disabled {{ color: {C.TEXT_DIM}; }}''')
+        self._submit_btn.setStyleSheet(f'''QPushButton {{ background: {C.PRI}; color: {C.BG}; border: none; border-radius: 7px; padding: 9px 18px; font: bold 10pt 'Segoe UI'; }}''')
+        buttons.addWidget(self._test_btn)
+        buttons.addStretch()
+        buttons.addWidget(self._cancel_btn)
+        buttons.addWidget(self._submit_btn)
+        layout.addLayout(buttons)
+        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self._test_btn.clicked.connect(self._test_connection)
+        self._submit_btn.clicked.connect(self._submit)
+        self._cancel_btn.clicked.connect(self.dismissed.emit)
+        self._test_result.connect(self._finish_test)
+        for signal in (self._model_combo.currentTextChanged, self._key_input.textChanged, self._url_input.textChanged):
+            signal.connect(self._edited)
         self._on_provider_changed()
+        if self._cfg.get('ai_model'):
+            self._model_combo.setCurrentText(self._cfg['ai_model'])
 
-        # Preload saved model / key if present
-        saved_model = cfg.get("ai_model", "")
-        if saved_model:
-            self._model_combo.setCurrentText(saved_model)
+    def _toggle_key(self, shown):
+        self._key_input.setEchoMode(QLineEdit.EchoMode.Normal if shown else QLineEdit.EchoMode.Password)
+        self._show_key.setText('Hide' if shown else 'Show')
 
-        # ── 4. Operating System ───────────────────────
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep2)
-        layout.addSpacing(2)
+    def _edited(self, *_):
+        self._generation += 1
+        self._status.setText('Settings changed. Test this connection before saving if needed.')
+        self._status.setStyleSheet(f'color: {C.TEXT_MED}; background: transparent;')
 
-        layout.addWidget(_lbl("OPERATING SYSTEM", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
-        det_name = {"windows": "Windows", "mac": "macOS", "linux": "Linux"}.get(detected, detected)
-        layout.addWidget(_lbl(f"Auto-detected: {det_name}", 7, color=C.ACC2,
-                               align=Qt.AlignmentFlag.AlignLeft))
-
-        os_row = QHBoxLayout(); os_row.setSpacing(6)
-        self._os_btns: dict[str, QPushButton] = {}
-        for key, label in [("windows","⊞  Windows"),("mac","  macOS"),("linux","🐧  Linux")]:
-            btn = QPushButton(label)
-            btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-            btn.setFixedHeight(28)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _, k=key: self._sel(k))
-            os_row.addWidget(btn)
-            self._os_btns[key] = btn
-        layout.addLayout(os_row)
-        self._sel(self._sel_os)
-        layout.addSpacing(8)
-
-        # ── 5. Submit Button ─────────────────────────
-        init_btn = QPushButton("▸  INITIALISE ULTRON")
-        init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
-        init_btn.setFixedHeight(34)
-        init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        init_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: #00121d; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
-            }}
-            QPushButton:hover {{
-                background: {C.PRI_GHO}; border: 1px solid {C.PRI};
-            }}
-        """)
-        init_btn.clicked.connect(self._submit)
-        layout.addWidget(init_btn)
-
-    def _on_provider_changed(self):
-        p_key = self._provider_combo.currentData() or "gemini"
-        info = PROVIDER_INFO.get(p_key, PROVIDER_INFO["gemini"])
-
-        # Populate models
+    def _on_provider_changed(self, *_):
+        from core.provider_settings import KEY_FIELDS, URL_FIELDS
+        provider = self._provider_combo.currentData() or 'gemini'
+        info = PROVIDER_INFO[provider]
         self._model_combo.clear()
-        for m in info["models"]:
-            self._model_combo.addItem(m)
-        self._model_combo.setCurrentText(info.get("default_model", ""))
+        self._model_combo.addItems(info['models'])
+        self._model_combo.setCurrentText(info['default_model'])
+        key = self._cfg.get(KEY_FIELDS.get(provider, provider + '_api_key'), '')
+        if not key and self._cfg.get('ai_provider') == provider:
+            key = self._cfg.get('api_key', '')
+        self._key_input.setText(key)
+        self._key_input.setPlaceholderText('Optional for local servers' if provider == 'ollama' else 'Paste the key for this provider')
+        self._show_key.setChecked(False)
+        self._url_input.setText(self._cfg.get(URL_FIELDS.get(provider, provider + '_base_url')) or info.get('default_url', ''))
+        self._url_input.setVisible(info.get('has_url', False))
+        self._url_lbl.setVisible(info.get('has_url', False))
+        self._edited()
 
-        # Update API key label and placeholder
-        self._key_lbl.setText(f"3. {info.get('key_label', 'API KEY')}")
-        self._key_input.setPlaceholderText(info.get("key_placeholder", ""))
+    def _connection(self):
+        from core.provider_settings import Connection
+        return Connection(self._provider_combo.currentData(), self._model_combo.currentText(),
+                          self._key_input.text(), self._url_input.text()).validated()
 
-        # Pre-fill key from config
-        cfg = _read_full_config()
-        p_key_val = (
-            cfg.get(f"{p_key}_api_key") or
-            (cfg.get("gemini_api_key") if p_key == "gemini" else "") or
-            (cfg.get("openai_api_key") if p_key == "gpt" else "") or
-            (cfg.get("api_key") if cfg.get("ai_provider") == p_key else "") or
-            ""
-        )
-        self._key_input.setText(p_key_val)
+    def _test_connection(self):
+        if self._checking:
+            return
+        try:
+            connection = self._connection()
+        except ValueError as error:
+            self.show_error(str(error))
+            return
+        generation = self._generation
+        self._checking = True
+        self._test_btn.setEnabled(False)
+        self._status.setText('Checking your provider and model…')
+        def worker():
+            from core.provider_transport import test_connection
+            try:
+                message, success = test_connection(connection), True
+            except Exception as error:
+                message, success = str(error), False
+            try:
+                self._test_result.emit(generation, connection, success, message)
+            except RuntimeError:
+                pass  # The application was closed while the network request finished.
+        threading.Thread(target=worker, daemon=True, name='provider-test').start()
 
-        # Update URL field visibility & placeholder
-        if info.get("has_url", False):
-            self._url_lbl.show()
-            self._url_lbl.setText(info.get("url_label", "SERVER / BASE URL"))
-            self._url_input.show()
-            saved_url = (
-                cfg.get(f"{p_key}_base_url") or
-                (cfg.get("llm_url") if p_key == "ollama" else "")
-            ) or info.get("default_url", "")
-            self._url_input.setText(saved_url)
-            self._url_input.setPlaceholderText(info.get("default_url", ""))
-        else:
-            self._url_lbl.hide()
-            self._url_input.hide()
+    def _finish_test(self, generation, connection, success, message):
+        self._checking = False
+        if not self.isVisible():
+            self.deleteLater()
+            return
+        self._test_btn.setEnabled(True)
+        if generation != self._generation:
+            self._status.setText('Settings changed during the check. Test the new configuration again.')
+            return
+        self._status.setText(message)
+        self._status.setStyleSheet(f'color: {C.GREEN if success else C.RED}; background: transparent;')
 
-    def _sel(self, key: str):
-        self._sel_os = key
-        pal = {"windows":(C.PRI,"#001a22"),"mac":(C.ACC2,"#1a1400"),"linux":(C.GREEN,"#001a0d")}
-        for k, btn in self._os_btns.items():
-            if k == key:
-                fg, bg = pal[k]
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {fg}; color: {bg};
-                        border: none; border-radius: 3px; font-weight: bold;
-                    }}
-                """)
-            else:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: #000d12; color: {C.TEXT_DIM};
-                        border: 1px solid {C.BORDER}; border-radius: 3px;
-                    }}
-                    QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
-                """)
+    def show_error(self, message):
+        self._status.setText(message)
+        self._status.setStyleSheet(f'color: {C.RED}; background: transparent;')
 
     def _submit(self):
-        p_key = self._provider_combo.currentData() or "gemini"
-        model = self._model_combo.currentText().strip()
-        key = self._key_input.text().strip()
-        url = self._url_input.text().strip()
-
-        # Validate
-        if p_key != "ollama" and not key:
-            self._key_input.setStyleSheet(
-                f"""
-                QLineEdit {{
-                    background: #000d12; color: {C.TEXT};
-                    border: 1px solid {C.RED}; border-radius: 3px; padding: 4px 8px;
-                    font-family: 'Courier New'; font-size: 9pt;
-                }}
-                """
-            )
+        try:
+            connection = self._connection()
+        except ValueError as error:
+            self.show_error(str(error))
             return
-
-        res = {
-            "provider": p_key,
-            "model": model,
-            "api_key": key,
-            "base_url": url,
-            "os_system": self._sel_os,
-            "assistant_name": "Ultron",
-        }
-        self.done.emit(res)
+        self.done.emit({'provider': connection.provider, 'model': connection.model,
+                       'api_key': connection.key, 'base_url': connection.base_url,
+                       'os_system': self._sel_os, 'assistant_name': self._cfg.get('assistant_name', 'Ultron'),
+                       'tools_enabled': self._tools_check.isChecked(),
+                       'speak_replies': self._voice_check.isChecked(),
+                       'listen_on_launch': self._listen_check.isChecked()})
 
 
 class HueWheel(QWidget):
@@ -3626,6 +3575,7 @@ class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
+    _microphone_sig = pyqtSignal(bool)
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
@@ -3669,6 +3619,8 @@ class MainWindow(QMainWindow):
         )
 
         self.on_text_command   = None
+        self.on_new_conversation = None
+        self.on_close = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_telegram_update = None  # callable: (token: str, chat_id: str, enabled: bool) -> None
         self._telegram_overlay = None
@@ -3915,6 +3867,7 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
+        self._microphone_sig.connect(self._microphone_available)
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
@@ -3944,6 +3897,8 @@ class MainWindow(QMainWindow):
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
         if not self._ready:
+            self._mute_btn.setEnabled(False)
+            self._mute_btn.setText('CONNECT TO ENABLE VOICE')
             self._show_setup()
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
@@ -4531,12 +4486,7 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         cw = self.centralWidget()
         if self._overlay and self._overlay.isVisible():
-            ow, oh = 460, 390
-            self._overlay.setGeometry(
-                (cw.width()  - ow) // 2,
-                (cw.height() - oh) // 2,
-                ow, oh,
-            )
+            self._position_connection_setup()
         if self._remote_overlay and self._remote_overlay.isVisible():
             ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
             self._remote_overlay.setGeometry(
@@ -4776,8 +4726,8 @@ class MainWindow(QMainWindow):
         lay.addStretch()
 
         for txt, col in [
-            ("AI CORE\nONLINE",   C.GREEN),
-            ("TACTICAL\nSECURED", C.PRI),
+            ("LOCAL\nWORKSPACE",   C.GREEN),
+            ("ULTRON\nDESKTOP", C.PRI),
             ("PROTOCOL\n" + APP_PROTOCOL, C.TEXT_MED),
         ]:
             lbl = QLabel(txt)
@@ -5142,6 +5092,12 @@ class MainWindow(QMainWindow):
         """)
         send.clicked.connect(self._send)
         row.addWidget(send)
+        fresh = QPushButton('New chat')
+        fresh.setMinimumHeight(32)
+        fresh.setToolTip('Clear conversation context after the current response finishes')
+        fresh.setStyleSheet(f'color: {C.TEXT_MED}; background: {C.PANEL2}; border: 1px solid {C.BORDER_B}; border-radius: 5px; padding: 5px;')
+        fresh.clicked.connect(lambda: self.on_new_conversation() if self.on_new_conversation else None)
+        row.addWidget(fresh)
         return row
 
     def _build_content_panel(self) -> QWidget:
@@ -6282,10 +6238,15 @@ class MainWindow(QMainWindow):
     def _send(self):
         txt = self._input.text().strip()
         if not txt: return
-        self._input.clear()
-        self._log.append_log(f"You: {txt}")
-        if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
+        if not self._ready or self.on_text_command is None:
+            self._log.append_log("SYS: Connect your provider first. Your message has been kept.")
+            self._show_setup()
+            return
+        if len(txt) > 16000:
+            self._log.append_log("SYS: Please keep messages under 16,000 characters.")
+            return
+        if self.on_text_command(txt) is not False:
+            self._input.clear()
 
     def _apply_state(self, state: str):
         self.hud.state    = state
@@ -6298,25 +6259,14 @@ class MainWindow(QMainWindow):
         self.hud.clear_active_task(success)
 
     def _check_config(self) -> bool:
-        if not API_FILE.exists(): return False
+        from core.provider_settings import from_config
         try:
-            d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            if not d.get("os_system"):
+            config = _read_full_config()
+            if config.get('os_system') not in ('windows', 'mac', 'linux'):
                 return False
-            provider = d.get("ai_provider", "").strip().lower()
-            if not provider:
-                return False
-            if provider == "ollama":
-                return True
-            key = (
-                d.get(f"{provider}_api_key") or
-                d.get(f"{provider}_key") or
-                d.get("api_key") or
-                (d.get("gemini_api_key") if provider == "gemini" else "") or
-                (d.get("openai_api_key") if provider == "gpt" else "")
-            )
-            return bool(key and len(str(key).strip()) > 3)
-        except Exception:
+            from_config(config)
+            return True
+        except (ValueError, TypeError, AttributeError):
             return False
 
     def _show_setup(self):
@@ -6325,71 +6275,72 @@ class MainWindow(QMainWindow):
             return
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
-        ow, oh = min(500, cw.width() - 30), min(540, cw.height() - 30)
+        ow, oh = min(680, cw.width() - 40), min(660, cw.height() - 40)
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
             ow, oh,
         )
         ov.done.connect(self._on_setup_done)
+        ov.dismissed.connect(self._dismiss_connection_setup)
         ov.show()
         ov.raise_()
         self._overlay = ov
+        QTimer.singleShot(0, self._position_connection_setup)
+
+    def _position_connection_setup(self):
+        if self._overlay is None:
+            return
+        central = self.centralWidget()
+        width, height = min(680, central.width()-40), min(640, central.height()-40)
+        self._overlay.setGeometry((central.width()-width)//2, (central.height()-height)//2, width, height)
+
+    def _dismiss_connection_setup(self):
+        if self._overlay is not None:
+            overlay, self._overlay = self._overlay, None
+            overlay._generation += 1
+            overlay.hide()
+            if not overlay._checking:
+                overlay.deleteLater()
+        if not self._ready:
+            self._apply_state('STANDBY')
 
     def _on_setup_done(self, config_data: dict):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        current = _read_full_config()
-        current.update(config_data)
-
-        provider = config_data.get("provider", "gemini")
-        model = config_data.get("model", "")
-        key = config_data.get("api_key", "")
-        url = config_data.get("base_url", "")
-        os_name = config_data.get("os_system", "windows")
-
-        current["ai_provider"] = provider
-        current["ai_model"] = model
-        current["os_system"] = os_name
-        current["assistant_name"] = current.get("assistant_name") or "Ultron"
-
-        if provider == "gemini":
-            current["gemini_api_key"] = key
-        elif provider == "ollama":
-            current["llm_url"] = url or "http://localhost:11434"
-            current["llm_model"] = model
-        elif provider == "gpt":
-            current["openai_api_key"] = key
-            if url: current["openai_base_url"] = url
-        elif provider == "nvidia_nim":
-            current["nvidia_api_key"] = key
-            current["nvidia_base_url"] = url or "https://integrate.api.nvidia.com/v1"
-        elif provider == "opencode_zen":
-            current["opencode_api_key"] = key
-            current["opencode_base_url"] = url or "https://api.opencode.zen/v1"
-        elif provider == "claude":
-            current["anthropic_api_key"] = key
-        elif provider == "deepseek":
-            current["deepseek_api_key"] = key
-            current["deepseek_base_url"] = url or "https://api.deepseek.com"
-        elif provider == "groq":
-            current["groq_api_key"] = key
-        elif provider == "openrouter":
-            current["openrouter_api_key"] = key
-            current["openrouter_base_url"] = url or "https://openrouter.ai/api/v1"
-
-        API_FILE.write_text(
-            json.dumps(current, indent=4),
-            encoding="utf-8",
-        )
+        from memory.config_manager import save_config
+        from core.provider_settings import Connection, updated_config
+        provider = config_data['provider']
+        current = updated_config(_read_full_config(), Connection(provider, config_data['model'],
+                                 config_data['api_key'], config_data['base_url']))
+        current.update({'ai_provider': provider, 'ai_model': config_data['model'],
+                        'os_system': config_data['os_system'],
+                        'assistant_name': config_data['assistant_name'],
+                        'tools_enabled': config_data['tools_enabled'],
+                        'speak_replies': config_data['speak_replies'],
+                        'listen_on_launch': config_data['listen_on_launch']})
+        try:
+            save_config(current)
+        except OSError:
+            if self._overlay:
+                self._overlay.show_error('Could not save preferences. Check that the configuration directory is writable.')
+            return
         self._ready = True
-        if self._overlay:
-            self._overlay.hide()
-            self._overlay = None
-        self._apply_state("LISTENING")
-        self._assistant_name = current.get("assistant_name", "Ultron") or "Ultron"
-        self._log.append_log(f"SYS: Initialised. Provider={provider.upper()} ({model}). OS={os_name.upper()}. {self._assistant_name} online.")
-        if getattr(self, "on_ai_provider_change", None):
+        self._dismiss_connection_setup()
+        self._apply_state('ONLINE')
+        self._assistant_name = current['assistant_name']
+        self._log.append_log(f"SYS: Connection saved. {provider.upper()} / {current['ai_model']}")
+        if self.on_ai_provider_change:
             self.on_ai_provider_change()
+
+    def _microphone_available(self, available):
+        self._mute_btn.setEnabled(available)
+        if not available:
+            self._muted = True
+            self.hud.muted = True
+            self._mute_btn.setText('TEXT MODE · MICROPHONE OFF')
+            self._mute_btn.setToolTip('Enable voice input in connection settings and connect an audio device, then restart.')
+        else:
+            self._style_mute_btn()
+
 
 
 class _RootShim:
@@ -6408,6 +6359,26 @@ class JarvisUI:
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
         self._win.show()
+        self._app.aboutToQuit.connect(lambda: self._win.on_close() if self._win.on_close else None)
+
+    def set_microphone_available(self, available):
+        self._win._microphone_sig.emit(bool(available))
+
+    @property
+    def on_new_conversation(self):
+        return self._win.on_new_conversation
+
+    @on_new_conversation.setter
+    def on_new_conversation(self, callback):
+        self._win.on_new_conversation = callback
+
+    @property
+    def on_close(self):
+        return self._win.on_close
+
+    @on_close.setter
+    def on_close(self, callback):
+        self._win.on_close = callback
 
     @property
     def muted(self) -> bool:
