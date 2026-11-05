@@ -556,6 +556,16 @@ class JarvisLive:
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
+        from core.conversation import Conversation
+        self._conversation = Conversation()
+        self._command_lock = threading.Lock()
+        self._turn_cancel = None
+        self._tts_player = None
+        try:
+            self._has_microphone = any(device['max_input_channels'] > 0 for device in sd.query_devices())
+        except Exception:
+            self._has_microphone = False
+        self.ui.set_microphone_available(self._has_microphone)
         self._interrupted          = False   # True while draining audio after user interrupt
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
@@ -584,9 +594,15 @@ class JarvisLive:
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
+        self.ui.on_close          = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
-        self.ui.on_ai_provider_change = lambda: self.request_reconnect(keep_context=False, reason="AI provider change")
+        def change_provider():
+            if self._turn_cancel is not None:
+                self._turn_cancel.set()
+            self.request_reconnect(keep_context=False, reason="AI provider change")
+        self.ui.on_ai_provider_change = change_provider
+        self.ui.on_new_conversation = self._new_conversation
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
@@ -770,7 +786,7 @@ class JarvisLive:
             "capabilities": _describe_tools(_all_decls),
             "limits": _describe_limits(
                 has_vision="screen_process" in _names,
-                has_mic=True,
+                has_mic=self._has_microphone,
             ),
         })
 
@@ -1043,29 +1059,41 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
-    def _on_text_command(self, text: str):
-        if not self._loop:
-            return
-        # Respect wake-word sleep: a typed command must not be answered while
-        # asleep either (the sleep gate is not just for the mic). Wake first with
-        # "Hey Jarvis" or the WAKE NOW button.
-        if self._wake_enabled and not self._awake:
-            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
-            return
+    def _new_conversation(self):
+        if self._command_lock.locked() or not self._conversation.clear():
+            self.ui.write_log("SYS: Stop the current response before starting a new conversation.")
+            return False
+        self._session_log.clear()
+        if self.session is not None:
+            self.request_reconnect(keep_context=False, reason='New conversation')
+            self.ui.write_log('SYS: Starting a new voice session…')
+            return True
+        self.ui.write_log("SYS: Conversation cleared. What would you like to work on?")
+        return True
 
+    def _on_text_command(self, text: str):
+        if not self._loop or not self._loop.is_running():
+            self.ui.write_log("SYS: The assistant is starting. Your message has been kept; try again shortly.")
+            return False
+        if self._wake_enabled and not self._awake:
+            self.ui.write_log("SYS: Wake the assistant before sending a message.")
+            return False
         if self.session is not None:
             asyncio.run_coroutine_threadsafe(
                 self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": text}]},
-                    turn_complete=True
-                ),
-                self._loop
-            )
-        else:
-            asyncio.run_coroutine_threadsafe(
-                self._handle_unified_text_command(text),
-                self._loop
-            )
+                    turns={"role": "user", "parts": [{"text": text}]}, turn_complete=True),
+                self._loop)
+            return True
+        if not self._command_lock.acquire(blocking=False):
+            self.ui.write_log("SYS: A response is running. Wait or interrupt it; your message has been kept.")
+            return False
+        self._turn_cancel = threading.Event()
+        try:
+            asyncio.run_coroutine_threadsafe(self._handle_unified_text_command(text, reserved=True), self._loop)
+        except Exception:
+            self._command_lock.release()
+            return False
+        return True
 
     def _get_pre_action_acknowledgment(self, user_text: str, fn_name: str, fn_args: dict) -> str:
         """
@@ -1178,175 +1206,67 @@ class JarvisLive:
                 f"Right away {name}, hold on a moment.",
             ])
 
-    async def _handle_unified_text_command(self, text: str):
+    async def _handle_unified_text_command(self, text: str, reserved=False):
         from core import llm_client
-        from memory.config_manager import get_ai_provider, get_ai_model, get_user_name
-        provider = get_ai_provider() or "ollama"
-        model = get_ai_model() or "gemma4:31b-cloud"
+        from core.conversation import ConversationCancelled
+        from core.prompting import auto_prompt
+        from core.provider_settings import from_config
+        from core.provider_transport import call_provider
 
+        if not reserved:
+            if not self._command_lock.acquire(blocking=False):
+                self.ui.write_log("SYS: A response is already running. Please wait before another command.")
+                return
+            self._turn_cancel = threading.Event()
+        stopped = self._turn_cancel.is_set
+        self._interrupted = False
         self.ui.set_state("THINKING")
-        self.ui.set_active_task("neural_cognition", label="NEURAL COGNITION // ANALYZING DIRECTIVE")
+        self.ui.set_active_task("neural_cognition", label="WORKING ON YOUR REQUEST")
         self.ui.write_log(f"User: {text}")
-        if self._dashboard:
-            try:
-                asyncio.create_task(self._dashboard.broadcast({
-                    "type": "log",
-                    "speaker": "user",
-                    "text": text,
-                    "ts": datetime.now().isoformat(),
-                }))
-            except Exception:
-                pass
-        print(f"[Ultron] Processing command: '{text}' using {provider.upper()} ({model})...")
-
-        # Build unified prompt & tool declarations
-        sys_prompt, tools_decl = self._build_full_system_prompt()
-
-        loop = asyncio.get_event_loop()
         try:
-            res = await loop.run_in_executor(
-                None,
-                lambda: llm_client.call_unified(
-                    prompt_or_messages=text,
-                    system=sys_prompt,
-                    tools=tools_decl,
-                    provider=provider,
-                    model=model,
-                )
-            )
-
-            reply = res.get("content", "")
-            tool_calls = res.get("tool_calls", [])
-
-            if tool_calls:
-                # ── Phase 1: Immediate Human-Like Conversational Acknowledgment ──
-                first_tc = tool_calls[0]
-                first_fn = first_tc.get("function", {}).get("name", "")
-                first_args = first_tc.get("function", {}).get("arguments", {})
-                if isinstance(first_args, str):
-                    try:
-                        first_args = json.loads(first_args)
-                    except Exception:
-                        first_args = {}
-
-                ack = reply.strip() if (reply and len(reply.strip()) > 5) else self._get_pre_action_acknowledgment(text, first_fn, first_args)
-                if ack:
-                    self.ui.write_log(f"{self._asst_name}: {ack}")
-                    print(f"[Ultron] Pre-action acknowledgment: '{ack}'")
-                    if self._dashboard:
-                        try:
-                            asyncio.create_task(self._dashboard.broadcast({
-                                "type": "log",
-                                "speaker": "ultron",
-                                "text": ack,
-                                "ts": datetime.now().isoformat(),
-                                "speak": True,
-                            }))
-                        except Exception:
-                            pass
-                    # Spin up tool task animation immediately so HUD displays active work
-                    self.ui.set_active_task(first_fn, details=str(first_args))
-                    self.set_speaking(True, keep_task=True)
-                    try:
-                        from core.tts import create_tts_player
-                        player = create_tts_player({"tts_engine": "edgetts"})
-                        await loop.run_in_executor(None, lambda: player.speak(ack, on_level=self.ui.set_audio_level))
-                    except Exception as _ae:
-                        print(f"[Ultron] Pre-action TTS error: {_ae}")
-                    finally:
-                        self.set_speaking(False)
-
-                # ── Phase 2: Execute Tools & Synthesize Handover Result ──
-                user_tag = (get_user_name() or "Abuzar").strip()
-                for tc in tool_calls:
-                    fn_name = tc.get("function", {}).get("name", "")
-                    fn_args = tc.get("function", {}).get("arguments", {})
-                    if isinstance(fn_args, str):
-                        try:
-                            fn_args = json.loads(fn_args)
-                        except Exception:
-                            fn_args = {}
-                    self.ui.write_log(f"SYS: Calling tool '{fn_name}'...")
-                    if self._dashboard:
-                        try:
-                            asyncio.create_task(self._dashboard.broadcast({
-                                "type": "sys",
-                                "text": f"EXECUTING DIRECTIVE: {fn_name.upper()}",
-                            }))
-                        except Exception:
-                            pass
-                    print(f"[Ultron] Executing tool: '{fn_name}' with args: {fn_args}")
-                    self.ui.set_active_task(fn_name, details=str(fn_args))
-                    tool_res = await loop.run_in_executor(
-                        None,
-                        lambda: self._execute_tool_sync(fn_name, fn_args)
-                    )
-                    print(f"[Ultron] Tool '{fn_name}' output: {str(tool_res)[:100]}")
-                    # Keep HUD animation active! Update label during follow-up synthesis
-                    self.ui.set_active_task(fn_name, label="NEURAL SYNTHESIS // COMPILING DIRECTIVE REPORT", details=str(fn_args))
-                    followup = await loop.run_in_executor(
-                        None,
-                        lambda: llm_client.call_unified(
-                            prompt_or_messages=(
-                                f"User request: {text}\n"
-                                f"Tool '{fn_name}' execution result: {tool_res}\n\n"
-                                f"You already told the Boss ({user_tag}) you were working on it. "
-                                f"Now deliver the final completed result directly to them in natural, human conversational style like handing over what was requested (e.g. 'Here is what you asked for, {user_tag}...', 'Yeh raha {user_tag}...'). "
-                                f"Be concise, chillingly confident, and authoritative as Ultron. Match the language of the user's request (English or Hindi)."
-                            ),
-                            system=sys_prompt,
-                            provider=provider,
-                            model=model,
-                        )
-                    )
-                    reply = followup.get("content", reply or str(tool_res))
-
-            if reply:
-                self.ui.write_log(f"{self._asst_name}: {reply}")
-                print(f"[Ultron] Ultron response: '{reply}'")
-                if self._dashboard:
-                    try:
-                        asyncio.create_task(self._dashboard.broadcast({
-                            "type": "log",
-                            "speaker": "ultron",
-                            "text": reply,
-                            "ts": datetime.now().isoformat(),
-                            "speak": True,
-                        }))
-                    except Exception:
-                        pass
-                # Trigger completion burst shockwave right when final speech starts!
-                self.ui.clear_active_task(success=True)
-                self.set_speaking(True)
-                try:
-                    from core.tts import create_tts_player
-                    player = create_tts_player({"tts_engine": "edgetts"})
-                    await loop.run_in_executor(None, lambda: player.speak(reply, on_level=self.ui.set_audio_level))
-                except Exception as _te:
-                    print(f"[Ultron] TTS error: {_te}")
-                finally:
-                    self.set_speaking(False)
-                    self.ui.set_state("ONLINE")
-            else:
-                self.ui.clear_active_task(success=False)
-                self.set_speaking(False)
-                self.ui.set_state("ONLINE")
-
-        except Exception as e:
-            print(f"[Ultron] Command execution error: {e}")
-            self.ui.write_log(f"ERR: {provider.upper()} error: {e}")
+            cfg = load_api_keys()
+            connection = from_config(cfg)
+            sys_prompt, declarations = self._build_full_system_prompt()
+            if not cfg.get('tools_enabled', True):
+                declarations = []
+            tools = llm_client._format_tools_for_openai(declarations)
+            sys_prompt += auto_prompt(text, tools, self._has_microphone)
+            def call(messages):
+                return call_provider(connection, messages, tools)
+            def report(name, output):
+                self.ui.write_log(f"TOOL: {name}: {output[:1000]}")
+            reply = await asyncio.to_thread(
+                self._conversation.reply, text, sys_prompt, tools, call, self._execute_tool_sync,
+                stopped, (connection.provider, connection.model, connection.base_url),
+                connection.provider, report)
+            if stopped():
+                raise ConversationCancelled()
+            self.ui.write_log(f"{self._asst_name}: {reply}")
+            self._session_log.extend([f"User: {text}", f"{self._asst_name}: {reply}"])
+            self._session_log = self._session_log[-24:]
             if self._dashboard:
-                try:
-                    asyncio.create_task(self._dashboard.broadcast({
-                        "type": "sys",
-                        "text": f"EXECUTION ERROR: {str(e)[:60]}",
-                    }))
-                except Exception:
-                    pass
+                await self._dashboard.broadcast({"type": "log", "speaker": "ultron",
+                    "text": reply, "ts": datetime.now().isoformat(), "speak": cfg.get('speak_replies', True)})
+            self.ui.clear_active_task(success=True)
+            if cfg.get('speak_replies', _platform.system() == 'Windows') and not stopped():
+                from core.tts import create_tts_player
+                self._tts_player = create_tts_player(cfg)
+                self.set_speaking(True)
+                await asyncio.to_thread(self._tts_player.speak, reply, on_level=self.ui.set_audio_level)
+        except ConversationCancelled:
+            self.ui.write_log("SYS: Response stopped. Actions already completed cannot be undone.")
             self.ui.clear_active_task(success=False)
+        except asyncio.CancelledError:
+            self._turn_cancel.set()
+            raise
+        except Exception as error:
+            self.ui.write_log(f"ERR: {error}")
+            self.ui.clear_active_task(success=False)
+        finally:
+            self._tts_player = None
             self.set_speaking(False)
             self.ui.set_state("ONLINE")
-
+            self._command_lock.release()
 
     async def _unified_audio_stt_worker(self):
         """Processes microphone audio in Unified mode using SpeechRecognition and adaptive VAD."""
@@ -1480,8 +1400,12 @@ class JarvisLive:
         self._reconnect_event.clear()
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._watch_reconnect())
-            tg.create_task(self._listen_audio())
-            tg.create_task(self._unified_audio_stt_worker())
+            if load_api_keys().get('listen_on_launch', True) and self._has_microphone:
+                tg.create_task(self._listen_audio())
+                tg.create_task(self._unified_audio_stt_worker())
+            else:
+                self.ui.set_microphone_available(False)
+                self.ui.write_log("SYS: Text mode is ready. Voice input is off or no microphone is available.")
             tg.create_task(self._run_system_monitor())
             tg.create_task(self._run_background_monitor())
             tg.create_task(self._run_sleep_watch())
@@ -1774,6 +1698,13 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        if self._turn_cancel is not None:
+            self._turn_cancel.set()
+        if self._tts_player is not None:
+            try:
+                self._tts_player.stop()
+            except Exception:
+                pass
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -2247,8 +2178,10 @@ class JarvisLive:
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
-            raise
+            self._has_microphone = False
+            self.ui.set_microphone_available(False)
+            self.ui.write_log("SYS: Microphone unavailable. Text chat remains available; check your audio device before restarting voice input.")
+            print(f"[JARVIS] Microphone unavailable: {type(e).__name__}")
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.

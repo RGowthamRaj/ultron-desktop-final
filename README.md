@@ -1,6 +1,8 @@
 # 🤖 ULTRON AI
 ### Autonomous Desktop Intelligence, Neural Knowledge Graph & Workstation Orchestrator
 
+Desktop release branch: `ui-polish`. Based on [AbuZar-Ansarii/Ultron](https://github.com/AbuZar-Ansarii/Ultron), with the upstream history preserved.
+
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)](#)
 [![LLM](https://img.shields.io/badge/Engine-Gemini%20Live%20%7C%20Ollama%20%7C%20OpenAI-purple.svg)](#)
@@ -34,30 +36,37 @@
 
 ---
 
+## Desktop release workflow
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the finished connection flow, automatic prompt context,
+conversation history, cancellation, platform limits, and beginner launch instructions. Start with
+`python run.py --doctor`, then `python run.py`. `python run.py --preview` renders the actual UI
+without a provider key. Build a shareable source archive with `python scripts/build_release.py`.
+
+The standard assistant's desktop tools and voice options are explicit choices in setup. Text chat
+works without a microphone. Live provider access and hardware actions need your own configuration;
+the automated tests use local servers or mocks and do not verify real-world workstation actions.
+
 ## 🚀 Quick Start
 
 ### 1. Clone & Install
 ```bash
-git clone https://github.com/AbuZar-Ansarii/Ultron.git
-cd "Ultron"
+git clone --branch ui-polish https://github.com/RGowthamRaj/ultron-desktop-final.git
+cd "ultron-desktop-final"
 pip install -r requirements.txt
 ```
 
 ### 2. Configure API Key
-Create or edit `config/api_keys.json` with your free [Google Gemini API Key](https://aistudio.google.com/app/apikey) (or copy from `config/api_keys.json.example`):
-```json
-{
-  "gemini_api_key": "YOUR_GEMINI_API_KEY",
-  "provider": "gemini",
-  "model": "models/gemini-2.0-flash-exp",
-  "ultron_voice_warp": true,
-  "voice_warp_intensity": 0.55
-}
-```
+Launch the app and choose your provider in the connection panel. Enter its model ID and API key,
+then use **Test connection** or **Save and start**. Choose **Explore UI** to inspect the interface
+without connecting. Keep **Speak replies** and **Listen on launch** off for text-only use.
+
+Advanced configuration uses `config/api_keys.json.example` as a template; `ai_provider` and
+`ai_model` are the active settings. Never share `config/api_keys.json`.
 
 ### 3. Launch Ultron
 ```bash
-python main.py
+python run.py
 ```
 
 ---
